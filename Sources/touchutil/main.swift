@@ -3,15 +3,17 @@
 //
 //  macOS does not natively route absolute touch input from external USB
 //  touchscreens to the correct display. This tool reads the digitizer's
-//  single-finger reports via IOHIDManager and:
+//  contact reports via IOHIDManager and:
 //    • 1 finger      → move cursor, tap-to-click, drag
+//    • 2 fingers     → smooth scroll or pinch-to-zoom
+//    • 3+ fingers    → Spaces / Mission Control / App Exposé
 //    • double-tap    → double-click
 //    • long-press    → right-click
 //    • edge swipe    → Spaces / Mission Control / App Exposé (via shortcuts)
 //
-//  This is single-pointer touch only. Multi-touch would require a DriverKit HID
-//  driver (paid Apple Developer account to sign/notarize). IOHIDManager is the
-//  free, userspace alternative — the trade-off is single-finger only.
+//  This is userspace gesture recognition, not native touch injection. Apps see
+//  public mouse, scroll, zoom-shortcut, and navigation events. Native touch
+//  contacts would require an entitlement-gated DriverKit HID extension.
 //
 //  Works on Apple Silicon and Intel. No kernel extension, no SIP changes.
 //
@@ -207,6 +209,40 @@ func inspectDevices() {
     }
 }
 
+/// Print every digitizer element, including its collection ancestry. Repeated
+/// Finger collections are how multi-contact panels associate X/Y/tip values
+/// with a contact identifier.
+func inspectDeviceDetails() {
+    let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+    IOHIDManagerSetDeviceMatching(mgr, [
+        kIOHIDDeviceUsagePageKey as String: 0x0D,
+        kIOHIDDeviceUsageKey as String: 0x04,
+    ] as CFDictionary)
+    IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+    guard let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, !set.isEmpty else {
+        print("No touchscreen devices (Input Monitoring may be required)."); return
+    }
+    for dev in set {
+        let name = IOHIDDeviceGetProperty(dev, kIOHIDProductKey as CFString) as? String ?? "?"
+        print("Device: \(name)")
+        guard let elements = IOHIDDeviceCopyMatchingElements(dev, nil, 0) as? [IOHIDElement] else { continue }
+        for e in elements {
+            let p = IOHIDElementGetUsagePage(e), u = IOHIDElementGetUsage(e)
+            var ancestors: [String] = []
+            var parent = IOHIDElementGetParent(e)
+            while let collection = parent {
+                ancestors.append(String(format: "%02X/%02X", IOHIDElementGetUsagePage(collection), IOHIDElementGetUsage(collection)))
+                parent = IOHIDElementGetParent(collection)
+            }
+            print(String(format: "  cookie=%-4d report=%-2d type=%-2d page=%02X usage=%02X logical=[%d..%d] parent=%@",
+                         Int(IOHIDElementGetCookie(e)), IOHIDElementGetReportID(e), IOHIDElementGetType(e).rawValue,
+                         p, u, IOHIDElementGetLogicalMin(e), IOHIDElementGetLogicalMax(e),
+                         ancestors.joined(separator: "<")))
+        }
+        print("")
+    }
+}
+
 func runSetup() {
     listDisplays()
     print("\nEnter the index of the touchscreen display: ", terminator: "")
@@ -228,7 +264,24 @@ final class TouchDriver {
     private let source = CGEventSource(stateID: .hidSystemState)
     private var manager: IOHIDManager!
 
-    // Single-finger pointer state (Button 0x09/0x01 + GD X/Y "mouse collection").
+    // Pointer state and raw HID contacts. Contacts are keyed by their nearest
+    // Digitizers/Finger collection, so repeated X/Y/tip elements do not stomp
+    // on one another.
+    private struct RawContact {
+        var identifier: Int?
+        var tip = false
+        var nx = 0.0
+        var ny = 0.0
+        var hasX = false
+        var hasY = false
+    }
+    private var rawContacts: [Int: RawContact] = [:]
+    private var elementSlots: [IOHIDElementCookie: Int] = [:]
+    private var frameTimer: Timer?
+    private var reportedContactCount: Int?
+    private var multiTouch = MultiTouchInterpreter()
+
+    // Single-finger pointer state.
     private var xLogicalMax = 4095.0
     private var yLogicalMax = 4095.0
     private var pNX = 0.0, pNY = 0.0
@@ -312,10 +365,10 @@ final class TouchDriver {
             .post(tap: .cgAnnotatedSessionEventTap)
     }
 
-    private func postKey(_ key: CGKeyCode, control: Bool) {
+    private func postKey(_ key: CGKeyCode, flags: CGEventFlags = []) {
         let d = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true)
         let u = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
-        if control { d?.flags = .maskControl; u?.flags = .maskControl }
+        d?.flags = flags; u?.flags = flags
         d?.post(tap: .cghidEventTap)
         u?.post(tap: .cghidEventTap)
     }
@@ -328,7 +381,7 @@ final class TouchDriver {
         let mc = CGEvent(keyboardEventSource: source, virtualKey: 160, keyDown: true)
         let mcu = CGEvent(keyboardEventSource: source, virtualKey: 160, keyDown: false)
         if mc == nil {
-            postKey(0x7E, control: true)
+            postKey(0x7E, flags: .maskControl)
         } else {
             mc?.post(tap: .cghidEventTap)
             mcu?.post(tap: .cghidEventTap)
@@ -361,39 +414,143 @@ final class TouchDriver {
             debugOut(String(format: "page=0x%02X usage=0x%02X val=%d", page, usage, v))
         }
 
-        switch (page, usage) {
-        case (0x01, 0x30):
-            pNX = Double(v) / xLogicalMax
-            if fingerDown { gestureMove() }
-        case (0x01, 0x31):
-            pNY = Double(v) / yLogicalMax
-            if fingerDown { gestureMove() }
-        case (0x09, 0x01):
-            let newTip = (v != 0)
-            if newTip {
-                // Finger (re)touching — cancel any pending tip-off and continue
-                // or start the gesture if not already active.
-                tipTimer?.invalidate(); tipTimer = nil
-                if !fingerDown {
-                    pTip = true
-                    if !config.gestures { simplePrimary(); return }
-                    gestureDown()
-                }
+        if page == 0x0D && usage == 0x54 {
+            reportedContactCount = Int(v)
+            scheduleFrame()
+            return
+        }
+
+        // Tip Switch is the HID Digitizers standard. Button 1 is retained as a
+        // compatibility fallback for panels that expose a mouse-like contact.
+        let isTip = (page == 0x0D && usage == 0x42) || (page == 0x09 && usage == 0x01)
+        let isContactID = page == 0x0D && usage == 0x51
+        let isX = page == 0x01 && usage == 0x30
+        let isY = page == 0x01 && usage == 0x31
+        guard isTip || isContactID || isX || isY else { return }
+
+        let slot = contactSlot(for: element)
+        var contact = rawContacts[slot] ?? RawContact()
+        if isTip {
+            contact.tip = v != 0
+        } else if isContactID {
+            contact.identifier = Int(v)
+        } else {
+            let minimum = Double(IOHIDElementGetLogicalMin(element))
+            let maximum = Double(IOHIDElementGetLogicalMax(element))
+            let normalized = maximum > minimum ? (Double(v) - minimum) / (maximum - minimum) : 0
+            if isX { contact.nx = min(1, max(0, normalized)); contact.hasX = true }
+            if isY { contact.ny = min(1, max(0, normalized)); contact.hasY = true }
+        }
+        rawContacts[slot] = contact
+        scheduleFrame()
+    }
+
+    /// Return the stable cookie for the nearest Digitizers/Finger collection.
+    /// A zero fallback keeps older single-contact mouse-style panels working.
+    private func contactSlot(for element: IOHIDElement) -> Int {
+        let cookie = IOHIDElementGetCookie(element)
+        if let cached = elementSlots[cookie] { return cached }
+        var candidate: IOHIDElement? = element
+        while let current = candidate {
+            if IOHIDElementGetUsagePage(current) == 0x0D && IOHIDElementGetUsage(current) == 0x22 {
+                let slot = Int(IOHIDElementGetCookie(current))
+                elementSlots[cookie] = slot
+                return slot
+            }
+            candidate = IOHIDElementGetParent(current)
+        }
+        elementSlots[cookie] = 0
+        return 0
+    }
+
+    /// IOHIDManager delivers each element separately. Coalesce callbacks from
+    /// one report into a contact frame before recognizing a gesture.
+    private func scheduleFrame() {
+        frameTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.001, repeats: false) { [weak self] _ in
+            self?.processContactFrame()
+        }
+        frameTimer = timer
+        RunLoop.current.add(timer, forMode: .common)
+    }
+
+    private func processContactFrame() {
+        frameTimer = nil
+        var contacts = rawContacts.compactMap { slot, raw -> TouchContact? in
+            guard raw.tip, raw.hasX, raw.hasY else { return nil }
+            return TouchContact(key: raw.identifier ?? slot,
+                                normalizedPoint: CGPoint(x: raw.nx, y: raw.ny))
+        }
+        contacts.sort { $0.key < $1.key }
+        if let reportedContactCount, reportedContactCount >= 0, contacts.count > reportedContactCount {
+            contacts = Array(contacts.prefix(reportedContactCount))
+        }
+        if config.debug {
+            let summary = contacts.map {
+                String(format: "%d:(%.3f,%.3f)", $0.key, $0.normalizedPoint.x, $0.normalizedPoint.y)
+            }.joined(separator: " ")
+            debugOut("FRAME contacts=\(contacts.count) \(summary)")
+        }
+
+        let actions = multiTouch.process(contacts, displaySize: bounds.size)
+        for action in actions {
+            switch action {
+            case .began:
+                cancelSingleForMultitouch()
+            case let .scroll(deltaX, deltaY):
+                testWindow?.send(.gesture("✌️ Two-finger Scroll", .systemBlue))
+                postScroll(deltaX: deltaX, deltaY: deltaY)
+            case let .zoom(steps):
+                testWindow?.send(.gesture(steps > 0 ? "🤏 Zoom In" : "🤏 Zoom Out", .systemTeal))
+                postZoom(steps: steps)
+            case let .navigate(direction):
+                postNavigation(direction)
+            case .ended:
+                break
+            }
+        }
+
+        guard contacts.count < 2, !multiTouch.suppressSingleFinger else { return }
+        if let contact = contacts.first {
+            pNX = contact.normalizedPoint.x
+            pNY = contact.normalizedPoint.y
+            pTip = true
+            tipTimer?.invalidate(); tipTimer = nil
+            if !config.gestures {
+                simplePrimary()
+            } else if !fingerDown {
+                gestureDown()
             } else {
-                // Finger may have lifted — debounce before ending gesture.
-                // Many digitizers pulse tip=0 between samples; we wait tipDebounce
-                // before treating it as a real lift.
-                pTip = false
+                gestureMove()
+            }
+        } else {
+            pTip = false
+            if !config.gestures {
+                simplePrimary()
+            } else if fingerDown {
+                // Preserve the original release debounce for controllers that
+                // briefly pulse Tip Switch off between otherwise valid frames.
                 tipTimer?.invalidate()
-                tipTimer = Timer(timeInterval: tipDebounce, repeats: false) { [weak self] _ in
-                    guard let self = self, !self.pTip else { return }
-                    if !self.config.gestures { self.simplePrimary(); return }
+                let timer = Timer(timeInterval: tipDebounce, repeats: false) { [weak self] _ in
+                    guard let self, self.rawContacts.values.allSatisfy({ !$0.tip }) else { return }
                     self.gestureUp()
                 }
-                RunLoop.current.add(tipTimer!, forMode: .common)
+                tipTimer = timer
+                RunLoop.current.add(timer, forMode: .common)
             }
-        default: return
         }
+    }
+
+    private func cancelSingleForMultitouch() {
+        tipTimer?.invalidate(); tipTimer = nil
+        cancelLongTimer(); cancelDragTimer()
+        if mousePressed {
+            let p = clamp(screenPoint(CGPoint(x: pNX, y: pNY)))
+            postMouse(.leftMouseUp, p)
+        }
+        fingerDown = false; mousePressed = false; movedBeyond = false
+        scrollMode = false; pDown = false
+        testWindow?.send(.lift)
     }
 
     private func now() -> Double { ProcessInfo.processInfo.systemUptime }
@@ -459,14 +616,43 @@ final class TouchDriver {
         postClick(sStartPx, .right, 1)
     }
 
-    private func postScroll(deltaY: Double) {
-        // Use pixel units for smooth continuous scrolling.
-        // Finger moves down → content scrolls down (natural touch direction).
-        let px = Int32((deltaY * scrollScale).rounded())
-        guard px != 0 else { return }
+    private func postScroll(deltaX: Double = 0, deltaY: Double) {
+        // Use pixel units for smooth continuous scrolling on both axes.
+        // Finger motion and content motion share a direction, matching direct
+        // manipulation and macOS's natural-scrolling convention.
+        let px = Int32((deltaX * scrollScale).rounded())
+        let py = Int32((deltaY * scrollScale).rounded())
+        guard px != 0 || py != 0 else { return }
         CGEvent(scrollWheelEvent2Source: source, units: .pixel,
-                wheelCount: 1, wheel1: px, wheel2: 0, wheel3: 0)?
+                wheelCount: 2, wheel1: py, wheel2: px, wheel3: 0)?
             .post(tap: .cghidEventTap)
+    }
+
+    /// Public macOS APIs cannot inject native magnify contacts. Cmd-plus and
+    /// Cmd-minus provide predictable zoom in browsers, Preview, and most
+    /// document apps while keeping the implementation entirely userspace.
+    private func postZoom(steps: Int) {
+        let bounded = max(-4, min(4, steps))
+        guard bounded != 0 else { return }
+        let key: CGKeyCode = bounded > 0 ? 0x18 : 0x1B  // '=' / '-'
+        for _ in 0..<abs(bounded) { postKey(key, flags: .maskCommand) }
+    }
+
+    private func postNavigation(_ direction: TouchNavigation) {
+        switch direction {
+        case .previousSpace:
+            testWindow?.send(.gesture("🤟 Previous Space", .systemPurple))
+            postKey(0x7B, flags: .maskControl) // Ctrl-left
+        case .nextSpace:
+            testWindow?.send(.gesture("🤟 Next Space", .systemPurple))
+            postKey(0x7C, flags: .maskControl) // Ctrl-right
+        case .missionControl:
+            testWindow?.send(.gesture("🤟 Mission Control", .systemPurple))
+            postKey(0x7E, flags: .maskControl) // Ctrl-up
+        case .appExpose:
+            testWindow?.send(.gesture("🤟 App Exposé", .systemPurple))
+            postKey(0x7D, flags: .maskControl) // Ctrl-down
+        }
     }
 
     private func gestureDown() {
@@ -662,9 +848,19 @@ final class TouchDriver {
         let devCb: IOHIDDeviceCallback = { ctx, _, _, dev in
             guard let ctx = ctx else { return }
             let me = Unmanaged<TouchDriver>.fromOpaque(ctx).takeUnretainedValue()
+            me.rawContacts.removeAll()
+            me.reportedContactCount = nil
             me.setupElements(dev)
         }
         IOHIDManagerRegisterDeviceMatchingCallback(manager, devCb, Unmanaged.passUnretained(self).toOpaque())
+        let removeCb: IOHIDDeviceCallback = { ctx, _, _, _ in
+            guard let ctx = ctx else { return }
+            let me = Unmanaged<TouchDriver>.fromOpaque(ctx).takeUnretainedValue()
+            me.rawContacts.removeAll()
+            me.reportedContactCount = 0
+            me.processContactFrame()
+        }
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, removeCb, Unmanaged.passUnretained(self).toOpaque())
 
         let cb: IOHIDValueCallback = { ctx, _, _, value in
             guard let ctx = ctx else { return }
@@ -752,7 +948,7 @@ final class AppReopenDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Argument parsing
 
-let version = "1.2.8"
+let version = "1.3.0-local"
 
 func printUsage() {
     print("""
@@ -762,7 +958,7 @@ func printUsage() {
       touchutil [options]
 
     With no options it auto-detects the touchscreen display (or uses your saved
-    --setup choice) and enables single-finger gestures.
+    --setup choice) and enables local touchscreen gestures.
 
     Single-finger gestures (work on any panel):
       • move              → cursor
@@ -774,12 +970,18 @@ func printUsage() {
       • edge swipe inward → left:prev Space  right:next Space
                             top:Mission Control  bottom:App Exposé
 
+    Multi-finger gestures (on multi-contact HID panels):
+      • two-finger move   → smooth horizontal / vertical scroll
+      • two-finger pinch  → zoom in / out (Cmd-plus / Cmd-minus)
+      • three+ swipe      → Spaces left/right, Mission Control, App Exposé
+
     OPTIONS:
       --no-gestures              Plain pointer only (no tap/long-press/edge gestures)
       --setup                    Interactively pick & remember the touchscreen display
       --list-displays            List displays, then exit
       --list-devices             List HID devices, then exit
       --inspect                  Show a touchscreen's HID capabilities, then exit
+      --inspect-details          Show every HID element and Finger collection
       --display-index N          Map touch to display at index N (remembered)
       --display-vendor V         Match target display by vendor number (remembered)
       --display-model M          Match target display by model number
@@ -836,6 +1038,7 @@ while i < args.count {
     case "--list-displays": listDisplays(); exit(0)
     case "--list-devices": listDevices(); exit(0)
     case "--inspect": inspectDevices(); exit(0)
+    case "--inspect-details": inspectDeviceDetails(); exit(0)
     case "--no-gestures": config.gestures = false
     case "--display-index":
         i += 1

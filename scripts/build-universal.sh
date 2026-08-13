@@ -10,7 +10,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-SRC=(Sources/touchutil/main.swift Sources/touchutil/TestWindow.swift)
+SRC=(Sources/touchutil/main.swift Sources/touchutil/TestWindow.swift Sources/touchutil/MultiTouch.swift)
 OUT_DIR="build"
 DEPLOY="11.0"
 mkdir -p "$OUT_DIR"
