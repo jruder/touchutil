@@ -10,6 +10,10 @@ let package = Package(
         .executableTarget(
             name: "touchutil",
             path: "Sources/touchutil"
+        ),
+        .testTarget(
+            name: "touchutilTests",
+            dependencies: ["touchutil"]
         )
     ]
 )

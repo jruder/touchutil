@@ -1,6 +1,6 @@
 # touchutil
 
-Make an external **USB touchscreen** work naturally on macOS — tap, scroll, drag, and edge swipes.
+Make an external **USB touchscreen** work naturally on macOS — tap, scroll, drag, pinch, and navigation swipes.
 
 ## The problem this solves
 
@@ -19,14 +19,14 @@ external touchscreen's absolute touch input to its own display.
 
 - ✅ Apple Silicon + Intel (universal binary)
 - ✅ No kernel extension, no SIP changes, no paid developer account
-- ✅ Tap, double-tap, scroll, drag, long-press, edge swipes
+- ✅ Tap, double-tap, scroll, drag, long-press, pinch, and multi-finger navigation
 
 ## Limitations
 
-- **Single-finger only.** Multi-finger gestures (pinch, two-finger scroll, etc.)
-  require a DriverKit HID driver, which needs a paid Apple Developer account to
-  sign and notarize. This tool uses `IOHIDManager` — free and userspace — and
-  single-finger is the trade-off.
+- Multi-finger input is recognized locally and translated into public macOS
+  scroll and keyboard events. It is not native multi-contact injection: an app
+  that requires ten independent touch points will not see them. Native touch
+  emulation requires an entitlement-gated DriverKit HID system extension.
 
 ## Requirements
 
@@ -124,6 +124,10 @@ on every run.
 | Vertical swipe | Scroll up / down |
 | Hold 0.35s then drag horizontally | Select text / move / resize windows |
 | Swipe inward from bottom-left corner | Mission Control (show all windows) |
+| Two-finger move | Smooth horizontal / vertical scroll |
+| Two-finger pinch | Zoom using Command-plus / Command-minus |
+| Three-finger swipe left / right | Next / previous Space |
+| Three-finger swipe up / down | Mission Control / App Exposé |
 
 ### Options
 
@@ -135,6 +139,7 @@ on every run.
 | `--list-displays` | List displays and detected touch devices |
 | `--list-devices` | List all HID devices |
 | `--inspect` | Dump a touchscreen's HID capabilities |
+| `--inspect-details` | Dump every HID element and Finger collection |
 | `--display-index N` | Map touch to display index `N` (remembered) |
 | `--vendor-id 0xVVVV` / `--product-id 0xPPPP` | Match a specific touch device |
 | `--debug` | Log raw HID events to stderr |
@@ -155,9 +160,10 @@ on every run.
 
 ## How it works
 
-`IOHIDManager` matches the touchscreen digitizer, reads absolute X/Y + tip
-switch from each HID report, and maps the normalized coordinates onto the
-chosen display. Gestures are recognised from movement direction and timing.
+`IOHIDManager` matches the touchscreen digitizer, groups absolute X/Y, contact
+identifier, and Tip Switch values by Finger collection, and maps normalized
+coordinates onto the chosen display. Gestures are recognised from contact
+count, centroid movement, and distance changes.
 Click events are posted via `CGEvent` without manual click-count manipulation —
 macOS counts consecutive taps naturally, exactly like a real mouse.
 A display-reconfiguration callback refreshes the target when you rearrange or
