@@ -9,6 +9,12 @@ final class MultiTouchInterpreterTests: XCTestCase {
         points.enumerated().map { TouchContact(key: $0.offset, normalizedPoint: $0.element) }
     }
 
+    func testClicksUseHIDEventTap() {
+        XCTAssertEqual(clickEventTap(button: .left, count: 1), .cghidEventTap)
+        XCTAssertEqual(clickEventTap(button: .left, count: 2), .cghidEventTap)
+        XCTAssertEqual(clickEventTap(button: .right, count: 1), .cghidEventTap)
+    }
+
     func testTwoFingerParallelMovementScrolls() {
         var subject = MultiTouchInterpreter()
         XCTAssertEqual(subject.process(contacts([CGPoint(x: 0.3, y: 0.3), CGPoint(x: 0.5, y: 0.3)]), displaySize: size), [.began])

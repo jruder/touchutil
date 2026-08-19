@@ -27,13 +27,13 @@ lipo -create -output "$OUT_DIR/touchutil" \
 
 rm -f "$OUT_DIR/touchutil-arm64" "$OUT_DIR/touchutil-x86_64"
 
-# Code-sign (ad-hoc) with a stable, unique identifier so macOS has a
-# consistent identity for privacy permissions. Note: rebuilding still changes
-# the binary's code hash, so you may need to re-grant Input Monitoring /
-# Accessibility after a rebuild.
+# Code-sign with a stable, unique identifier. Release builds fall back to
+# ad-hoc signing; local developers can set CODESIGN_IDENTITY to a certificate
+# hash so rebuilt binaries retain the same TCC designated requirement.
 BUNDLE_ID="${BUNDLE_ID:-com.eriproject.touchutil}"
-echo "Code-signing (ad-hoc, identifier=$BUNDLE_ID)..."
-codesign --force --sign - --identifier "$BUNDLE_ID" "$OUT_DIR/touchutil"
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+echo "Code-signing (identity=$CODESIGN_IDENTITY, identifier=$BUNDLE_ID)..."
+codesign --force --sign "$CODESIGN_IDENTITY" --identifier "$BUNDLE_ID" "$OUT_DIR/touchutil"
 
 # Assemble a background .app bundle. Bundling gives macOS a stable, registered
 # identity (the bundle id) so privacy permissions can be revoked with tccutil
@@ -69,8 +69,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-echo "Code-signing app bundle (ad-hoc, identifier=$BUNDLE_ID)..."
-codesign --force --deep --sign - --identifier "$BUNDLE_ID" "$APP"
+echo "Code-signing app bundle (identity=$CODESIGN_IDENTITY, identifier=$BUNDLE_ID)..."
+codesign --force --deep --sign "$CODESIGN_IDENTITY" --identifier "$BUNDLE_ID" "$APP"
 
 echo
 echo "Built:"

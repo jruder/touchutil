@@ -30,6 +30,10 @@ import Foundation
 import IOKit
 import IOKit.hid
 
+func clickEventTap(button: CGMouseButton, count: Int) -> CGEventTapLocation {
+    .cghidEventTap
+}
+
 // MARK: - Config
 
 struct Config {
@@ -569,15 +573,11 @@ final class TouchDriver {
     /// system double-click window (~500ms) would be escalated to clickCount=2,
     /// causing one physical tap to behave like a double-click.
     private func postClick(_ p: CGPoint, _ button: CGMouseButton, _ count: Int = 1) {
-        // Tap-level routing — each fixes a different problem:
-        //  • Single left click → annotated-session tap. The HID tap double-fires
-        //    a single click in some apps (YouTube play button), so use the
-        //    session tap which delivers it exactly once.
-        //  • Right-click & double-click → HID tap. The session tap silently drops
-        //    right-click context menus and clickState=2 double-clicks; the HID
-        //    tap delivers them reliably.
-        let isSingleLeft = (button == .left && count == 1)
-        let tap: CGEventTapLocation = isSingleLeft ? .cgAnnotatedSessionEventTap : .cghidEventTap
+        // Route every click through the HID tap. On macOS 26 the annotated
+        // session tap can accept a posted single-click without delivering it;
+        // the HID tap is also the route used by the working scroll gestures.
+        // Explicit clickState keeps single/double/triple clicks unambiguous.
+        let tap = clickEventTap(button: button, count: count)
 
         let down: CGEventType = (button == .right) ? .rightMouseDown : .leftMouseDown
         let up:   CGEventType = (button == .right) ? .rightMouseUp   : .leftMouseUp
