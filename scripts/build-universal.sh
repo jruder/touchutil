@@ -10,7 +10,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-SRC=(Sources/touchutil/main.swift Sources/touchutil/TestWindow.swift Sources/touchutil/MultiTouch.swift)
+SRC=(
+    Sources/touchutil/main.swift
+    Sources/touchutil/TestWindow.swift
+    Sources/touchutil/MultiTouch.swift
+    Sources/touchutil/TouchHealth.swift
+    Sources/touchutil/MacOSHealthAdapters.swift
+)
 OUT_DIR="build"
 DEPLOY="11.0"
 mkdir -p "$OUT_DIR"
@@ -59,9 +65,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.4.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>4</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>LSUIElement</key>

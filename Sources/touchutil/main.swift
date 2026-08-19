@@ -51,6 +51,7 @@ struct Config {
 struct SavedConfig: Codable {
     var displayVendor: UInt32
     var displayModel: UInt32
+    var displayName: String?
 }
 
 func configURL() -> URL {
@@ -68,6 +69,49 @@ func saveConfig(_ c: SavedConfig) {
     try? FileManager.default.createDirectory(
         at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     if let data = try? JSONEncoder().encode(c) { try? data.write(to: url) }
+}
+
+func savedDisplayTarget() -> SavedDisplayTarget? {
+    guard let saved = loadSavedConfig() else { return nil }
+    return SavedDisplayTarget(
+        vendor: saved.displayVendor,
+        model: saved.displayModel,
+        name: saved.displayName
+    )
+}
+
+func saveDisplayTarget(_ id: CGDirectDisplayID) {
+    saveConfig(SavedConfig(
+        displayVendor: CGDisplayVendorNumber(id),
+        displayModel: CGDisplayModelNumber(id),
+        displayName: displayName(id)
+    ))
+}
+
+func configuredDisplayTarget(_ config: Config) -> SavedDisplayTarget? {
+    if let vendor = config.displayVendor, let model = config.displayModel {
+        let name = macOSOnlineDisplays().first {
+            $0.vendor == vendor && $0.model == model
+        }?.name
+        return SavedDisplayTarget(vendor: vendor, model: model, name: name)
+    }
+    return savedDisplayTarget()
+}
+
+func resolveConfiguredDisplay(_ config: Config) -> ResolvedTouchDisplay? {
+    if let index = config.displayIndex {
+        let active = activeDisplays()
+        guard index >= 0, index < active.count else { return nil }
+        saveDisplayTarget(active[index])
+    }
+    return DisplayTargetResolver.resolve(
+        target: configuredDisplayTarget(config),
+        displays: macOSOnlineDisplays()
+    )
+}
+
+func cgRect(_ bounds: TouchDisplayBounds) -> CGRect {
+    CGRect(x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height)
 }
 
 // MARK: - Helpers
@@ -130,7 +174,10 @@ func touchDevices() -> [IOHIDDevice] {
 
 func listDisplays() {
     let mainID = CGMainDisplayID()
-    let saved = loadSavedConfig()
+    let resolvedID = DisplayTargetResolver.resolve(
+        target: savedDisplayTarget(),
+        displays: macOSOnlineDisplays()
+    )?.output.id
     let devices = touchDevices()
     let hasTouchHardware = !devices.isEmpty
 
@@ -140,8 +187,7 @@ func listDisplays() {
         let main = (d == mainID) ? "  [MAIN]" : ""
         // Touch column: mark the display configured as the touchscreen.
         var touch = "  touch: —"
-        if let s = saved, CGDisplayVendorNumber(d) == s.displayVendor,
-           CGDisplayModelNumber(d) == s.displayModel {
+        if resolvedID == d {
             touch = "  touch: ✓ configured"
         } else if hasTouchHardware {
             touch = "  touch: ? (run --setup to assign)"
@@ -256,7 +302,7 @@ func runSetup() {
     guard idx >= 0, idx < displays.count else { err("Index out of range."); exit(1) }
     let d = displays[idx]
     let v = CGDisplayVendorNumber(d), m = CGDisplayModelNumber(d)
-    saveConfig(SavedConfig(displayVendor: v, displayModel: m))
+    saveConfig(SavedConfig(displayVendor: v, displayModel: m, displayName: displayName(d)))
     print("Saved. Touchscreen display remembered (vendor=\(v) model=\(m)).")
 }
 
@@ -267,6 +313,9 @@ final class TouchDriver {
     private var bounds: CGRect = .zero
     private let source = CGEventSource(stateID: .hidSystemState)
     private var manager: IOHIDManager!
+    private var driverAttached = false
+    private var healthSupervisor: TouchHealthSupervisor?
+    private var healthWatchdog: Timer?
 
     // Pointer state and raw HID contacts. Contacts are keyed by their nearest
     // Digitizers/Finger collection, so repeated X/Y/tip elements do not stomp
@@ -322,39 +371,25 @@ final class TouchDriver {
     init(config: Config) { self.config = config }
 
     /// Expose resolved display bounds without starting the full driver (used by --test setup).
-    func boundsForTest() -> CGRect { resolveDisplay() }
+    func boundsForTest() -> CGRect {
+        resolveDisplay() ?? CGDisplayBounds(CGMainDisplayID())
+    }
 
     // MARK: Display resolution
 
-    private func resolveDisplay() -> CGRect {
-        let displays = activeDisplays()
-        let mainID = CGMainDisplayID()
-        if let idx = config.displayIndex, idx >= 0, idx < displays.count {
-            let d = displays[idx]
-            saveConfig(SavedConfig(displayVendor: CGDisplayVendorNumber(d), displayModel: CGDisplayModelNumber(d)))
-            return CGDisplayBounds(d)
+    private func resolveDisplay() -> CGRect? {
+        guard let resolved = resolveConfiguredDisplay(config) else {
+            err("WARNING: saved touchscreen display is unavailable or ambiguous; touch mapping is paused.")
+            return nil
         }
-        if let v = config.displayVendor, let m = config.displayModel {
-            for d in displays where CGDisplayVendorNumber(d) == v && CGDisplayModelNumber(d) == m {
-                saveConfig(SavedConfig(displayVendor: v, displayModel: m)); return CGDisplayBounds(d)
-            }
+        let target = resolved.physical
+        let output = resolved.output
+        if target.id == output.id {
+            err("Using saved touchscreen display \(output.name) (vendor=\(target.vendor) model=\(target.model)).")
+        } else {
+            err("Using mirror master \(output.name) for saved display vendor=\(target.vendor) model=\(target.model).")
         }
-        if let saved = loadSavedConfig() {
-            for d in displays where CGDisplayVendorNumber(d) == saved.displayVendor
-                && CGDisplayModelNumber(d) == saved.displayModel {
-                err("Using saved touchscreen display (vendor=\(saved.displayVendor) model=\(saved.displayModel)).")
-                return CGDisplayBounds(d)
-            }
-        }
-        let externals = displays.filter { $0 != mainID }
-        if let pick = externals.max(by: {
-            let a = CGDisplayBounds($0).size, b = CGDisplayBounds($1).size
-            return (a.width * a.height) < (b.width * b.height)
-        }) {
-            err("Auto-selected display vendor=\(CGDisplayVendorNumber(pick)) model=\(CGDisplayModelNumber(pick)). Use --setup to change.")
-            return CGDisplayBounds(pick)
-        }
-        return CGDisplayBounds(mainID)
+        return cgRect(output.bounds)
     }
 
     // MARK: Event synthesis
@@ -397,18 +432,25 @@ final class TouchDriver {
     /// Find the logical max for the General Desktop X / Y axes so we can
     /// normalize the panel's absolute coordinates to 0..1.
     private func setupElements(_ dev: IOHIDDevice) {
-        guard let elements = IOHIDDeviceCopyMatchingElements(dev, nil, 0) as? [IOHIDElement] else { return }
+        guard let elements = IOHIDDeviceCopyMatchingElements(dev, nil, 0) as? [IOHIDElement] else {
+            driverAttached = false
+            healthSupervisor?.refresh()
+            return
+        }
         for e in elements {
             let p = IOHIDElementGetUsagePage(e), u = IOHIDElementGetUsage(e)
             if p == 0x01 && u == 0x30 { xLogicalMax = max(xLogicalMax, Double(IOHIDElementGetLogicalMax(e))) }
             else if p == 0x01 && u == 0x31 { yLogicalMax = max(yLogicalMax, Double(IOHIDElementGetLogicalMax(e))) }
         }
+        driverAttached = true
         err("Touch input mapped (gestures \(config.gestures ? "ON" : "OFF")).")
+        healthSupervisor?.refresh()
     }
 
     // MARK: Per-value input
 
     private func handle(value: IOHIDValue) {
+        guard bounds.width > 0 && bounds.height > 0 else { return }
         let element = IOHIDValueGetElement(value)
         let page = IOHIDElementGetUsagePage(element)
         let usage = IOHIDElementGetUsage(element)
@@ -811,15 +853,21 @@ final class TouchDriver {
     }
 
     func run() {
+        let app = NSApplication.shared
         ensureInputMonitoring()
         ensureAccessibility()
-        bounds = resolveDisplay()
-        err("Targeting display: origin=(\(Int(bounds.origin.x)),\(Int(bounds.origin.y))) size=\(Int(bounds.size.width))x\(Int(bounds.size.height))")
+        if let resolvedBounds = resolveDisplay() {
+            bounds = resolvedBounds
+            err("Targeting display: origin=(\(Int(bounds.origin.x)),\(Int(bounds.origin.y))) size=\(Int(bounds.size.width))x\(Int(bounds.size.height))")
+        } else {
+            bounds = .zero
+        }
 
         CGDisplayRegisterReconfigurationCallback({ _, _, ctx in
             guard let ctx = ctx else { return }
             let me = Unmanaged<TouchDriver>.fromOpaque(ctx).takeUnretainedValue()
-            me.bounds = me.resolveDisplay()
+            me.bounds = me.resolveDisplay() ?? .zero
+            me.healthSupervisor?.refresh()
         }, Unmanaged.passUnretained(self).toOpaque())
 
         manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -859,6 +907,13 @@ final class TouchDriver {
             me.rawContacts.removeAll()
             me.reportedContactCount = 0
             me.processContactFrame()
+            // A single physical controller can expose more than one matching
+            // HID service.  Do not mark the whole driver detached when one
+            // service disappears; reconcile after IOKit has finished updating
+            // the manager's device set and confirm the physical device is gone.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak me] in
+                me?.reconcileHealth()
+            }
         }
         IOHIDManagerRegisterDeviceRemovalCallback(manager, removeCb, Unmanaged.passUnretained(self).toOpaque())
 
@@ -868,6 +923,8 @@ final class TouchDriver {
         }
         IOHIDManagerRegisterInputValueCallback(manager, cb, Unmanaged.passUnretained(self).toOpaque())
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+
+        installHealthSupervisor()
 
         // Handle SIGUSR1 — show the test window when signalled by a Finder launch.
         signal(SIGUSR1, SIG_IGN)
@@ -880,13 +937,52 @@ final class TouchDriver {
         err("Touch driver running. Press Ctrl+C to stop.")
         // Run through NSApplication so the reopen event (double-click in Finder
         // while already running) and signals are handled.
-        let app = NSApplication.shared
         let delegate = AppReopenDelegate(driver: self)
         app.delegate = delegate
         self.appDelegate = delegate   // retain
         app.setActivationPolicy(testWindow != nil ? .regular : .accessory)
         if testWindow != nil { app.activate(ignoringOtherApps: true) }
         app.run()
+    }
+
+    private func installHealthSupervisor() {
+        let vendorID = config.vendorID ?? 0x0EEF
+        let productID = config.productID ?? 0xC000
+        let inspector = MacOSTouchEnvironmentInspector(
+            vendorID: vendorID,
+            productID: productID,
+            targetProvider: { [config] in configuredDisplayTarget(config) },
+            attachedProvider: { [weak self] in self?.driverAttached ?? false }
+        )
+        let menu = MenuBarHealthReporter()
+        menu.onShowTester = { [weak self] in self?.showTestWindow() }
+        let reporter = CompositeTouchHealthReporter([
+            menu,
+            NotificationHealthReporter(),
+            JSONLHealthReporter(),
+        ])
+        let supervisor = TouchHealthSupervisor(inspector: inspector, reporter: reporter)
+        healthSupervisor = supervisor
+        supervisor.refresh()
+
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            self?.reconcileHealth()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        healthWatchdog = timer
+    }
+
+    private func reconcileHealth() {
+        let devices = (IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>) ?? []
+        if let device = devices.first {
+            if !driverAttached { setupElements(device) }
+        } else if !macOSTouchDevice(
+            vendorID: config.vendorID ?? 0x0EEF,
+            productID: config.productID ?? 0xC000
+        ).present {
+            driverAttached = false
+        }
+        healthSupervisor?.refresh()
     }
 
     /// Open the gesture test window (or bring it to front if already open).
@@ -909,13 +1005,14 @@ final class TouchDriver {
     /// Build the picker list from currently connected displays.
     private func buildDisplayOptions() -> [DisplayOption] {
         let mainID = CGMainDisplayID()
-        let saved = loadSavedConfig()
+        let resolvedID = DisplayTargetResolver.resolve(
+            target: configuredDisplayTarget(config),
+            displays: macOSOnlineDisplays()
+        )?.output.id
         return activeDisplays().enumerated().map { (i, d) in
             let b = CGDisplayBounds(d)
             let isMain = d == mainID
-            let isCurrent = saved.map {
-                CGDisplayVendorNumber(d) == $0.displayVendor && CGDisplayModelNumber(d) == $0.displayModel
-            } ?? false
+            let isCurrent = resolvedID == d
             // Index prefix distinguishes displays with identical names/resolutions.
             var label = "[\(i)] \(displayName(d))  ·  \(Int(b.width))×\(Int(b.height))"
             if isMain { label += "  (main)" }
@@ -927,9 +1024,10 @@ final class TouchDriver {
     /// Save the chosen display and switch touch mapping to it immediately.
     private func selectDisplay(_ id: CGDirectDisplayID) {
         let v = CGDisplayVendorNumber(id), m = CGDisplayModelNumber(id)
-        saveConfig(SavedConfig(displayVendor: v, displayModel: m))
+        saveConfig(SavedConfig(displayVendor: v, displayModel: m, displayName: displayName(id)))
         bounds = CGDisplayBounds(id)
         err("Touchscreen display set via GUI: vendor=\(v) model=\(m).")
+        healthSupervisor?.refresh()
     }
 }
 
@@ -948,7 +1046,7 @@ final class AppReopenDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Argument parsing
 
-let version = "1.3.0-local"
+let version = "1.4.0-local"
 
 func printUsage() {
     print("""
@@ -982,6 +1080,8 @@ func printUsage() {
       --list-devices             List HID devices, then exit
       --inspect                  Show a touchscreen's HID capabilities, then exit
       --inspect-details          Show every HID element and Finger collection
+      --doctor                   Explain current touch health and the next action
+      --doctor-json              Print the same health snapshot as JSON
       --display-index N          Map touch to display at index N (remembered)
       --display-vendor V         Match target display by vendor number (remembered)
       --display-model M          Match target display by model number
@@ -1009,6 +1109,17 @@ let selfPID = ProcessInfo.processInfo.processIdentifier
 let isAgent = CommandLine.arguments.contains("--agent")
 let launchedFromFinder = !isAgent && CommandLine.arguments.count == 1
 
+func doctorSnapshot() -> TouchHealthSnapshot {
+    if let current = JSONLHealthReporter.loadCurrent() { return current }
+    let inspector = MacOSTouchEnvironmentInspector(
+        vendorID: 0x0EEF,
+        productID: 0xC000,
+        targetProvider: { savedDisplayTarget() },
+        attachedProvider: { false }
+    )
+    return TouchHealthMachine.snapshot(for: inspector.inspect())
+}
+
 if launchedFromFinder,
    let pidStr = try? String(contentsOfFile: pidFile, encoding: .utf8),
    let runningPID = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -1019,11 +1130,6 @@ if launchedFromFinder,
     exit(0)
 }
 // No running agent — Finder launch starts driver + test window automatically.
-
-// Write PID file now (before any error exits) so Finder launches can find us.
-if !launchedFromFinder {
-    try? String(selfPID).write(toFile: pidFile, atomically: true, encoding: .utf8)
-}
 
 var config = Config()
 if launchedFromFinder { config.test = true }   // show test window when opened from Finder
@@ -1039,6 +1145,8 @@ while i < args.count {
     case "--list-devices": listDevices(); exit(0)
     case "--inspect": inspectDevices(); exit(0)
     case "--inspect-details": inspectDeviceDetails(); exit(0)
+    case "--doctor": printDoctor(doctorSnapshot(), json: false); exit(0)
+    case "--doctor-json": printDoctor(doctorSnapshot(), json: true); exit(0)
     case "--no-gestures": config.gestures = false
     case "--display-index":
         i += 1
@@ -1074,6 +1182,10 @@ while i < args.count {
     }
     i += 1
 }
+
+// Only a process that reaches the driver run loop owns the PID file. Read-only
+// CLI commands such as --doctor must never overwrite the running agent's PID.
+try? String(selfPID).write(toFile: pidFile, atomically: true, encoding: .utf8)
 
 let driver = TouchDriver(config: config)
 
