@@ -311,7 +311,8 @@ func runSetup() {
 final class TouchDriver {
     private let config: Config
     private var bounds: CGRect = .zero
-    private let source = CGEventSource(stateID: .hidSystemState)
+    private var targetDisplayID: CGDirectDisplayID = CGMainDisplayID()
+    private let input: InputDelivering = CoreGraphicsInputDeliverer()
     private var manager: IOHIDManager!
     private var driverAttached = false
     private var healthSupervisor: TouchHealthSupervisor?
@@ -333,6 +334,13 @@ final class TouchDriver {
     private var frameTimer: Timer?
     private var reportedContactCount: Int?
     private var multiTouch = MultiTouchInterpreter()
+    private var precisionTouch = PrecisionGestureInterpreter()
+    private let screenSampler: ScreenRegionSampling = makeScreenRegionSampler()
+    private let precisionOverlay: PrecisionOverlayPresenting = AppKitPrecisionOverlay()
+    private var captureAuthorization: ScreenCaptureAuthorization = .permissionRequired
+    private var currentLoupeState: PrecisionLoupeState?
+    private var requestedCapturePermissionThisRun = false
+    private weak var menuBarReporter: MenuBarHealthReporter?
 
     // Single-finger pointer state.
     private var xLogicalMax = 4095.0
@@ -362,10 +370,10 @@ final class TouchDriver {
     private let edgeSwipeThreshold = 40.0  // px to travel before edge key fires
     private let doubleTapInterval = 0.6    // max gap between two taps to count as double-tap
     private let doubleTapDist = 70.0       // max finger travel between taps (px)
-    private let scrollScale = 3.0
 
     var testWindow: TestWindow? = nil   // set when running --test
     private var signalSource: DispatchSourceSignal? = nil
+    private var escapeMonitor: Any? = nil
     private var appDelegate: NSObject? = nil
 
     init(config: Config) { self.config = config }
@@ -384,6 +392,7 @@ final class TouchDriver {
         }
         let target = resolved.physical
         let output = resolved.output
+        targetDisplayID = output.id
         if target.id == output.id {
             err("Using saved touchscreen display \(output.name) (vendor=\(target.vendor) model=\(target.model)).")
         } else {
@@ -399,32 +408,42 @@ final class TouchDriver {
                 y: bounds.origin.y + n.y * bounds.size.height)
     }
 
-    private func postMouse(_ type: CGEventType, _ p: CGPoint, button: CGMouseButton = .left) {
-        CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: button)?
-            .post(tap: .cgAnnotatedSessionEventTap)
+    private func precisionPoint(_ point: CGPoint) -> PrecisionPoint {
+        PrecisionPoint(x: point.x, y: point.y)
     }
 
-    private func postKey(_ key: CGKeyCode, flags: CGEventFlags = []) {
-        let d = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true)
-        let u = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
-        d?.flags = flags; u?.flags = flags
-        d?.post(tap: .cghidEventTap)
-        u?.post(tap: .cghidEventTap)
+    private func cgPoint(_ point: PrecisionPoint) -> CGPoint {
+        CGPoint(x: point.x, y: point.y)
+    }
+
+    private var precisionBounds: PrecisionRect {
+        PrecisionRect(
+            x: bounds.origin.x,
+            y: bounds.origin.y,
+            width: bounds.width,
+            height: bounds.height
+        )
+    }
+
+    private func postMouse(_ type: CGEventType, _ p: CGPoint, button: CGMouseButton = .left) {
+        let phase: InputPointerPhase
+        switch type {
+        case .leftMouseDown, .rightMouseDown: phase = .down
+        case .leftMouseDragged, .rightMouseDragged: phase = .dragged
+        case .leftMouseUp, .rightMouseUp: phase = .up
+        default: phase = .moved
+        }
+        input.pointer(
+            phase,
+            at: precisionPoint(p),
+            button: button == .right ? .right : .left
+        )
     }
 
     /// Trigger Mission Control (show all windows) via the F3 / Mission Control key.
     /// Falls back to Ctrl+Up which is the default keyboard shortcut.
     private func postMissionControl() {
-        // Key code 160 = F3 / Mission Control on Apple keyboards.
-        // Ctrl+Up (0x7E) is the default shortcut — use both for reliability.
-        let mc = CGEvent(keyboardEventSource: source, virtualKey: 160, keyDown: true)
-        let mcu = CGEvent(keyboardEventSource: source, virtualKey: 160, keyDown: false)
-        if mc == nil {
-            postKey(0x7E, flags: .maskControl)
-        } else {
-            mc?.post(tap: .cghidEventTap)
-            mcu?.post(tap: .cghidEventTap)
-        }
+        input.missionControl()
     }
 
     // MARK: HID element setup
@@ -590,11 +609,12 @@ final class TouchDriver {
     private func cancelSingleForMultitouch() {
         tipTimer?.invalidate(); tipTimer = nil
         cancelLongTimer(); cancelDragTimer()
+        handlePrecisionActions(precisionTouch.cancel())
         if mousePressed {
             let p = clamp(screenPoint(CGPoint(x: pNX, y: pNY)))
             postMouse(.leftMouseUp, p)
         }
-        fingerDown = false; mousePressed = false; movedBeyond = false
+        fingerDown = false; mousePressed = false; movedBeyond = false; longFired = false
         scrollMode = false; pDown = false
         testWindow?.send(.lift)
     }
@@ -615,22 +635,11 @@ final class TouchDriver {
     /// system double-click window (~500ms) would be escalated to clickCount=2,
     /// causing one physical tap to behave like a double-click.
     private func postClick(_ p: CGPoint, _ button: CGMouseButton, _ count: Int = 1) {
-        // Route every click through the HID tap. On macOS 26 the annotated
-        // session tap can accept a posted single-click without delivering it;
-        // the HID tap is also the route used by the working scroll gestures.
-        // Explicit clickState keeps single/double/triple clicks unambiguous.
-        let tap = clickEventTap(button: button, count: count)
-
-        let down: CGEventType = (button == .right) ? .rightMouseDown : .leftMouseDown
-        let up:   CGEventType = (button == .right) ? .rightMouseUp   : .leftMouseUp
-        if let d = CGEvent(mouseEventSource: source, mouseType: down, mouseCursorPosition: p, mouseButton: button) {
-            d.setIntegerValueField(.mouseEventClickState, value: Int64(max(1, count)))
-            d.post(tap: tap)
-        }
-        if let u = CGEvent(mouseEventSource: source, mouseType: up, mouseCursorPosition: p, mouseButton: button) {
-            u.setIntegerValueField(.mouseEventClickState, value: Int64(max(1, count)))
-            u.post(tap: tap)
-        }
+        input.click(
+            at: precisionPoint(p),
+            button: button == .right ? .right : .left,
+            count: count
+        )
     }
 
     private func startLongTimer() {
@@ -653,48 +662,116 @@ final class TouchDriver {
 
     private func longPressFired() {
         guard fingerDown, !movedBeyond, !edgeFired, !longFired else { return }
+        let actions = precisionTouch.arm()
+        guard !actions.isEmpty else { return }
         longFired = true
-        testWindow?.send(.gesture("⚙️ Long Press → Right-click", .systemOrange))
-        postClick(sStartPx, .right, 1)
+        testWindow?.send(.gesture("🔎 Precision Loupe", .systemOrange))
+        handlePrecisionActions(actions)
+    }
+
+    private func handlePrecisionActions(_ actions: [PrecisionGestureAction]) {
+        for action in actions {
+            switch action {
+            case let .armed(finger, target):
+                let state = makeLoupeState(finger: finger, target: target)
+                currentLoupeState = state
+                precisionOverlay.show(state)
+                beginLoupeCapture(for: state)
+            case let .moved(finger, target):
+                guard var state = currentLoupeState else { continue }
+                state.finger = finger
+                state.target = target
+                state.authorization = captureAuthorization
+                currentLoupeState = state
+                precisionOverlay.update(state)
+                screenSampler.update(captureRequest(for: state))
+            case let .commitLeft(point):
+                finishLoupe()
+                testWindow?.send(.gesture("🔎 Precision Click", .systemGreen))
+                input.warpPointer(to: point)
+                input.click(at: point, button: .left, count: 1)
+            case let .commitRight(point):
+                finishLoupe()
+                testWindow?.send(.gesture("⚙️ Long Press → Right-click", .systemOrange))
+                input.warpPointer(to: point)
+                input.click(at: point, button: .right, count: 1)
+            case .cancelled:
+                finishLoupe()
+            }
+        }
+    }
+
+    private func makeLoupeState(finger: PrecisionPoint, target: PrecisionPoint) -> PrecisionLoupeState {
+        PrecisionLoupeState(
+            displayID: targetDisplayID,
+            displayBounds: precisionBounds,
+            finger: finger,
+            target: precisionBounds.clamped(target),
+            authorization: captureAuthorization
+        )
+    }
+
+    private func captureRequest(for state: PrecisionLoupeState) -> ScreenRegionRequest {
+        ScreenRegionRequest(
+            displayID: state.displayID,
+            displayBounds: state.displayBounds,
+            target: state.target,
+            sourceSize: state.diameter / state.magnification,
+            outputSize: Int(state.diameter * 2)
+        )
+    }
+
+    private func beginLoupeCapture(for state: PrecisionLoupeState) {
+        guard captureAuthorization == .authorized else {
+            requestCapturePermissionIfNeeded(showExplanation: true)
+            return
+        }
+        screenSampler.start(
+            captureRequest(for: state),
+            onFrame: { [weak self] frame in self?.precisionOverlay.showFrame(frame) },
+            onFailure: { [weak self] message in
+                guard let self else { return }
+                err("WARNING: \(message)")
+                self.captureAuthorization = .failed
+                self.menuBarReporter?.updateLoupeAuthorization(.failed)
+                if var state = self.currentLoupeState {
+                    state.authorization = .failed
+                    self.currentLoupeState = state
+                    self.precisionOverlay.update(state)
+                }
+            }
+        )
+    }
+
+    private func finishLoupe() {
+        screenSampler.stop()
+        precisionOverlay.dismiss()
+        currentLoupeState = nil
     }
 
     private func postScroll(deltaX: Double = 0, deltaY: Double) {
-        // Use pixel units for smooth continuous scrolling on both axes.
-        // Finger motion and content motion share a direction, matching direct
-        // manipulation and macOS's natural-scrolling convention.
-        let px = Int32((deltaX * scrollScale).rounded())
-        let py = Int32((deltaY * scrollScale).rounded())
-        guard px != 0 || py != 0 else { return }
-        CGEvent(scrollWheelEvent2Source: source, units: .pixel,
-                wheelCount: 2, wheel1: py, wheel2: px, wheel3: 0)?
-            .post(tap: .cghidEventTap)
+        input.scroll(deltaX: deltaX, deltaY: deltaY)
     }
 
     /// Public macOS APIs cannot inject native magnify contacts. Cmd-plus and
     /// Cmd-minus provide predictable zoom in browsers, Preview, and most
     /// document apps while keeping the implementation entirely userspace.
     private func postZoom(steps: Int) {
-        let bounded = max(-4, min(4, steps))
-        guard bounded != 0 else { return }
-        let key: CGKeyCode = bounded > 0 ? 0x18 : 0x1B  // '=' / '-'
-        for _ in 0..<abs(bounded) { postKey(key, flags: .maskCommand) }
+        input.zoom(steps: steps)
     }
 
     private func postNavigation(_ direction: TouchNavigation) {
         switch direction {
         case .previousSpace:
             testWindow?.send(.gesture("🤟 Previous Space", .systemPurple))
-            postKey(0x7B, flags: .maskControl) // Ctrl-left
         case .nextSpace:
             testWindow?.send(.gesture("🤟 Next Space", .systemPurple))
-            postKey(0x7C, flags: .maskControl) // Ctrl-right
         case .missionControl:
             testWindow?.send(.gesture("🤟 Mission Control", .systemPurple))
-            postKey(0x7E, flags: .maskControl) // Ctrl-up
         case .appExpose:
             testWindow?.send(.gesture("🤟 App Exposé", .systemPurple))
-            postKey(0x7D, flags: .maskControl) // Ctrl-down
         }
+        input.navigate(direction)
     }
 
     private func gestureDown() {
@@ -702,6 +779,7 @@ final class TouchDriver {
         fingerDown = true; mousePressed = false; movedBeyond = false
         edgeFired = false; longFired = false; scrollMode = false; dragEnabled = false
         sStartPx = clamp(screenPoint(CGPoint(x: pNX, y: pNY)))
+        precisionTouch.begin(at: precisionPoint(sStartPx))
         lastScrollPx = sStartPx
         let m = edgeMarginN
         nearL = pNX < m; nearR = pNX > 1 - m; nearT = pNY < m; nearB = pNY > 1 - m
@@ -710,7 +788,7 @@ final class TouchDriver {
         // first tap lands on the touchscreen — not on whatever display the
         // cursor was previously on. Harmless for scroll (no button is pressed,
         // so the cursor just sits at the touch point without selecting).
-        CGWarpMouseCursorPosition(sStartPx)
+        input.warpPointer(to: precisionPoint(sStartPx))
         testWindow?.send(.touch(normX: pNX, normY: pNY))
         if config.debug {
             debugOut(String(format: "touch: nx=%.3f ny=%.3f  nearL=%d nearR=%d nearT=%d nearB=%d edgeResolved=%d",
@@ -731,6 +809,11 @@ final class TouchDriver {
 
     private func gestureMove() {
         let cur = clamp(screenPoint(CGPoint(x: pNX, y: pNY)))
+        let precisionActions = precisionTouch.move(to: precisionPoint(cur), within: precisionBounds)
+        if precisionTouch.isArmed {
+            handlePrecisionActions(precisionActions)
+            return
+        }
         let dist = hypot(cur.x - sStartPx.x, cur.y - sStartPx.y)
         if dist <= moveTol { return }   // wait for clear movement before committing to any gesture
 
@@ -738,6 +821,7 @@ final class TouchDriver {
             movedBeyond = true
             cancelLongTimer()
             cancelDragTimer()
+            handlePrecisionActions(precisionTouch.cancel())
             let dx = cur.x - sStartPx.x
             let dy = cur.y - sStartPx.y
             // Scroll when movement is vertical, UNLESS near top/bottom edge
@@ -791,7 +875,7 @@ final class TouchDriver {
             // Force the cursor to the touch start before grabbing, so the drag
             // grabs whatever is under the touchscreen point — not whatever the
             // cursor was previously over on another display.
-            CGWarpMouseCursorPosition(sStartPx)
+            input.warpPointer(to: precisionPoint(sStartPx))
             postMouse(.mouseMoved, sStartPx)
             postMouse(.leftMouseDown, sStartPx)
         }
@@ -804,6 +888,12 @@ final class TouchDriver {
         fingerDown = false; cancelLongTimer(); cancelDragTimer()
         let cur = clamp(screenPoint(CGPoint(x: pNX, y: pNY)))
         testWindow?.send(.lift)
+        if precisionTouch.isArmed {
+            handlePrecisionActions(precisionTouch.end())
+            longFired = false
+            return
+        }
+        _ = precisionTouch.cancel()
         if mousePressed { postMouse(.leftMouseUp, cur); mousePressed = false; return }
         if edgeFired || longFired || scrollMode { scrollMode = false; return }
 
@@ -866,6 +956,7 @@ final class TouchDriver {
         CGDisplayRegisterReconfigurationCallback({ _, _, ctx in
             guard let ctx = ctx else { return }
             let me = Unmanaged<TouchDriver>.fromOpaque(ctx).takeUnretainedValue()
+            me.handlePrecisionActions(me.precisionTouch.cancel())
             me.bounds = me.resolveDisplay() ?? .zero
             me.healthSupervisor?.refresh()
         }, Unmanaged.passUnretained(self).toOpaque())
@@ -896,6 +987,7 @@ final class TouchDriver {
         let devCb: IOHIDDeviceCallback = { ctx, _, _, dev in
             guard let ctx = ctx else { return }
             let me = Unmanaged<TouchDriver>.fromOpaque(ctx).takeUnretainedValue()
+            me.handlePrecisionActions(me.precisionTouch.cancel())
             me.rawContacts.removeAll()
             me.reportedContactCount = nil
             me.setupElements(dev)
@@ -956,6 +1048,7 @@ final class TouchDriver {
         )
         let menu = MenuBarHealthReporter()
         menu.onShowTester = { [weak self] in self?.showTestWindow() }
+        installPrecisionLoupe(menu: menu)
         let reporter = CompositeTouchHealthReporter([
             menu,
             NotificationHealthReporter(),
@@ -972,6 +1065,84 @@ final class TouchDriver {
         healthWatchdog = timer
     }
 
+    private func installPrecisionLoupe(menu: MenuBarHealthReporter) {
+        menuBarReporter = menu
+        captureAuthorization = screenSampler.authorization
+        menu.updateLoupeAuthorization(captureAuthorization)
+        menu.onEnablePrecisionLoupe = { [weak self] in
+            self?.requestCapturePermissionIfNeeded(showExplanation: true, force: true)
+        }
+        menu.onRestartTouchutil = {
+            NSApplication.shared.terminate(nil)
+        }
+        escapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 53 else { return }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.handlePrecisionActions(self.precisionTouch.cancel())
+            }
+        }
+
+        let promptKey = "precisionLoupe.permissionExplanationShown.v1"
+        if captureAuthorization == .permissionRequired,
+           !UserDefaults.standard.bool(forKey: promptKey) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                self?.requestCapturePermissionIfNeeded(showExplanation: true)
+            }
+        }
+    }
+
+    private func requestCapturePermissionIfNeeded(showExplanation: Bool, force: Bool = false) {
+        refreshPrecisionAuthorization()
+        guard captureAuthorization != .authorized,
+              captureAuthorization != .unsupported else { return }
+        guard force || !requestedCapturePermissionThisRun else { return }
+
+        let promptKey = "precisionLoupe.permissionExplanationShown.v1"
+        if showExplanation && !UserDefaults.standard.bool(forKey: promptKey) {
+            let alert = NSAlert()
+            alert.messageText = "Enable the Precision Touch Loupe?"
+            alert.informativeText = "touchutil needs Screen Recording permission to magnify the small area beneath your fingertip. Pixels stay on this Mac, are never saved, and capture runs only while the loupe is visible."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Enable Loupe")
+            alert.addButton(withTitle: "Later")
+            UserDefaults.standard.set(true, forKey: promptKey)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+
+        requestedCapturePermissionThisRun = true
+        screenSampler.requestAuthorization { [weak self] authorization in
+            guard let self else { return }
+            self.captureAuthorization = authorization
+            self.menuBarReporter?.updateLoupeAuthorization(authorization)
+            if var state = self.currentLoupeState {
+                state.authorization = authorization
+                self.currentLoupeState = state
+                self.precisionOverlay.update(state)
+                if authorization == .authorized {
+                    self.beginLoupeCapture(for: state)
+                }
+            }
+        }
+    }
+
+    private func refreshPrecisionAuthorization() {
+        let current = screenSampler.authorization
+        guard current != captureAuthorization,
+              captureAuthorization != .failed else { return }
+        captureAuthorization = current
+        menuBarReporter?.updateLoupeAuthorization(current)
+        if var state = currentLoupeState {
+            state.authorization = current
+            currentLoupeState = state
+            precisionOverlay.update(state)
+            if current == .authorized {
+                beginLoupeCapture(for: state)
+            }
+        }
+    }
+
     private func reconcileHealth() {
         let devices = (IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>) ?? []
         if let device = devices.first {
@@ -982,6 +1153,7 @@ final class TouchDriver {
         ).present {
             driverAttached = false
         }
+        refreshPrecisionAuthorization()
         healthSupervisor?.refresh()
     }
 
@@ -1046,7 +1218,7 @@ final class AppReopenDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Argument parsing
 
-let version = "1.4.0-local"
+let version = "1.5.0-local"
 
 func printUsage() {
     print("""
@@ -1062,7 +1234,8 @@ func printUsage() {
       • move              → cursor
       • tap               → click
       • double-tap        → double-click
-      • long-press (~0.5s)→ right-click
+      • hold (~0.5s)      → precision loupe; move + lift to click
+      • stationary hold   → right-click on lift
       • vertical drag     → scroll up / down
       • horizontal drag   → drag / select text / move windows
       • edge swipe inward → left:prev Space  right:next Space

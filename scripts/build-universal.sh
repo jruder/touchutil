@@ -16,6 +16,8 @@ SRC=(
     Sources/touchutil/MultiTouch.swift
     Sources/touchutil/TouchHealth.swift
     Sources/touchutil/MacOSHealthAdapters.swift
+    Sources/touchutil/PrecisionTouch.swift
+    Sources/touchutil/MacOSPrecisionLoupe.swift
 )
 OUT_DIR="build"
 DEPLOY="11.0"
@@ -65,9 +67,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.4.0</string>
+    <string>1.5.0</string>
     <key>CFBundleVersion</key>
-    <string>4</string>
+    <string>5</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>LSUIElement</key>

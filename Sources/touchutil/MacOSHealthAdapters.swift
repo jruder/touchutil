@@ -131,7 +131,10 @@ final class CompositeTouchHealthReporter: TouchHealthReporting {
 final class MenuBarHealthReporter: NSObject, TouchHealthReporting {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var latest: TouchHealthSnapshot?
+    private var loupeAuthorization: ScreenCaptureAuthorization = .permissionRequired
     var onShowTester: (() -> Void)?
+    var onEnablePrecisionLoupe: (() -> Void)?
+    var onRestartTouchutil: (() -> Void)?
 
     override init() {
         super.init()
@@ -146,6 +149,13 @@ final class MenuBarHealthReporter: NSObject, TouchHealthReporting {
         DispatchQueue.main.async { [weak self] in
             self?.latest = transition.current
             self?.setButton(state: transition.current.state)
+            self?.rebuildMenu()
+        }
+    }
+
+    func updateLoupeAuthorization(_ authorization: ScreenCaptureAuthorization) {
+        DispatchQueue.main.async { [weak self] in
+            self?.loupeAuthorization = authorization
             self?.rebuildMenu()
         }
     }
@@ -195,6 +205,26 @@ final class MenuBarHealthReporter: NSObject, TouchHealthReporting {
         copy.isEnabled = latest != nil
         menu.addItem(copy)
 
+        let loupe: NSMenuItem
+        switch loupeAuthorization {
+        case .authorized:
+            loupe = NSMenuItem(title: "Precision Loupe: Ready", action: nil, keyEquivalent: "")
+            loupe.isEnabled = false
+        case .permissionRequired:
+            loupe = NSMenuItem(title: "Enable Precision Loupe…", action: #selector(enablePrecisionLoupe), keyEquivalent: "")
+            loupe.target = self
+        case .restartRequired:
+            loupe = NSMenuItem(title: "Restart touchutil for Precision Loupe", action: #selector(restartTouchutil), keyEquivalent: "")
+            loupe.target = self
+        case .unsupported:
+            loupe = NSMenuItem(title: "Precision Loupe: Unsupported macOS", action: nil, keyEquivalent: "")
+            loupe.isEnabled = false
+        case .failed:
+            loupe = NSMenuItem(title: "Retry Precision Loupe…", action: #selector(enablePrecisionLoupe), keyEquivalent: "")
+            loupe.target = self
+        }
+        menu.addItem(loupe)
+
         if latest?.state == .permissionRequired {
             let input = NSMenuItem(title: "Open Input Monitoring Settings", action: #selector(openInputMonitoring), keyEquivalent: "")
             input.target = self
@@ -208,6 +238,10 @@ final class MenuBarHealthReporter: NSObject, TouchHealthReporting {
     }
 
     @objc private func showTester() { onShowTester?() }
+
+    @objc private func enablePrecisionLoupe() { onEnablePrecisionLoupe?() }
+
+    @objc private func restartTouchutil() { onRestartTouchutil?() }
 
     @objc private func copyDiagnostics() {
         guard let latest else { return }
